@@ -84,7 +84,7 @@ def main():
         if '_ptcld' in args.mode:
             # Pointcloud Visualisation using Open3D
             if vis is None:
-                vis = open3d.Visualizer()
+                vis = open3d.visualization.Visualizer()
                 vis.create_window(window_name=title)
                 pcd = open3d.geometry.PointCloud()
                 # initialise the geometry pre loop
@@ -95,8 +95,8 @@ def main():
                 vis.add_geometry(pcd)
                 render_option = vis.get_render_option()
                 render_option.background_color = np.array([0.1529, 0.1569, 0.1333], np.float32)
-                render_option.point_color_option = open3d.PointColorOption.ZCoordinate
-                coordinate_frame = open3d.geometry.create_mesh_coordinate_frame()
+                render_option.point_color_option = open3d.visualization.PointColorOption.ZCoordinate
+                coordinate_frame = open3d.geometry.TriangleMesh.create_coordinate_frame()
                 vis.add_geometry(coordinate_frame)
                 view_control = vis.get_view_control()
                 params = view_control.convert_to_pinhole_camera_parameters()
@@ -106,7 +106,7 @@ def main():
             pcd.points = open3d.utility.Vector3dVector(ptcld[:3].transpose().astype(np.float64))
             pcd.colors = open3d.utility.Vector3dVector(
                 np.tile(ptcld[3:].transpose(), (1, 3)).astype(np.float64) / 40)
-            vis.update_geometry()
+            vis.update_geometry(pcd)
             vis.poll_events()
             vis.update_renderer()
 

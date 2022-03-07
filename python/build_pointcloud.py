@@ -14,6 +14,7 @@
 
 import os
 import re
+import time
 import numpy as np
 
 from transform import build_se3_transform
@@ -80,6 +81,7 @@ def build_pointcloud(lidar_dir, poses_file, extrinsics_dir, start_time, end_time
     else:
         reflectance = np.empty((0))
 
+    print("Number of poses = ", len(poses))
     for i in range(0, len(poses)):
         scan_path = os.path.join(lidar_dir, str(timestamps[i]) + '.bin')
         if "velodyne" not in lidar:
@@ -109,8 +111,102 @@ def build_pointcloud(lidar_dir, poses_file, extrinsics_dir, start_time, end_time
             reflectance = np.concatenate((reflectance, ptcld[3]))
             scan = ptcld[:3]
 
-        scan = np.dot(np.dot(poses[i], G_posesource_laser), np.vstack([scan, np.ones((1, scan.shape[1]))]))
+        mask = np.broadcast_to(((scan[0] > -70) & (scan[0] < -3)), scan.shape)
+        scan = np.reshape(scan[mask], (3, -1))
+        scan = np.dot(np.dot(poses[i], G_posesource_laser), np.vstack([scan, np.ones((1, scan.shape[1]))])) # dot(4x4, 4xN)
         pointcloud = np.hstack([pointcloud, scan])
+
+
+    pointcloud = pointcloud[:, 1:]
+    if pointcloud.shape[1] == 0:
+        raise IOError("Could not find scan files for given time range in directory " + lidar_dir)
+
+    return pointcloud, reflectance
+
+
+def build_pointcloud_distance_range(lidar_dir, poses_file, extrinsics_dir, start_time, distance):
+    lidar = re.search('(lms_front|lms_rear|ldmrs|velodyne_left|velodyne_right)', lidar_dir).group(0)
+    timestamps_path = os.path.join(lidar_dir, os.pardir, lidar + '.timestamps')
+
+    origin_time = start_time
+    end_time = start_time + 1e7 #hopefully enough to cover 20 m range (might not work in case of long stays)
+    timestamps = []
+    with open(timestamps_path) as timestamps_file:
+        for line in timestamps_file:
+            timestamp = int(line.split(' ')[0])
+            if start_time <= timestamp <= end_time:
+                timestamps.append(timestamp)
+
+    if len(timestamps) == 0:
+        raise ValueError("No LIDAR data in the given time bracket.")
+
+    with open(os.path.join(extrinsics_dir, lidar + '.txt')) as extrinsics_file:
+        extrinsics = next(extrinsics_file)
+    G_posesource_laser = build_se3_transform([float(x) for x in extrinsics.split(' ')])
+
+    poses_type = re.search('(vo|ins|rtk)\.csv', poses_file).group(1)
+
+    if poses_type in ['ins', 'rtk']:
+        with open(os.path.join(extrinsics_dir, 'ins.txt')) as extrinsics_file:
+            extrinsics = next(extrinsics_file)
+            G_posesource_laser = np.linalg.solve(build_se3_transform([float(x) for x in extrinsics.split(' ')]),
+                                                 G_posesource_laser)
+
+        poses = interpolate_ins_poses(poses_file, timestamps, origin_time, use_rtk=(poses_type == 'rtk'))
+    else:
+        # sensor is VO, which is located at the main vehicle frame
+        poses = interpolate_vo_poses(poses_file, timestamps, origin_time)
+
+    pointcloud = np.array([[0], [0], [0], [0]])
+    if lidar == 'ldmrs':
+        reflectance = None
+    else:
+        reflectance = np.empty((0))
+
+    orig_pose = poses[0]
+    count = 0
+    for i in range(0, len(poses)):
+        diff_pose = np.linalg.inv(poses[i]) * orig_pose
+        diff_pose_norm = np.linalg.norm(diff_pose[:3, 3])
+        if diff_pose_norm > 20:
+            break
+
+        scan_path = os.path.join(lidar_dir, str(timestamps[i]) + '.bin')
+        if "velodyne" not in lidar:
+            if not os.path.isfile(scan_path):
+                continue
+
+            scan_file = open(scan_path)
+            scan = np.fromfile(scan_file, np.double)
+            scan_file.close()
+
+            scan = scan.reshape((len(scan) // 3, 3)).transpose()
+
+            if lidar != 'ldmrs':
+                # LMS scans are tuples of (x, y, reflectance)
+                reflectance = np.concatenate((reflectance, np.ravel(scan[2, :])))
+                scan[2, :] = np.zeros((1, scan.shape[1]))
+        else:
+            if os.path.isfile(scan_path):
+                ptcld = load_velodyne_binary(scan_path)
+            else:
+                scan_path = os.path.join(lidar_dir, str(timestamps[i]) + '.png')
+                if not os.path.isfile(scan_path):
+                    continue
+                ranges, intensities, angles, approximate_timestamps = load_velodyne_raw(scan_path)
+                ptcld = velodyne_raw_to_pointcloud(ranges, intensities, angles)
+
+            reflectance = np.concatenate((reflectance, ptcld[3]))
+            scan = ptcld[:3]
+
+        # removes points on the ego-car (x-axis points backward)
+        mask = np.broadcast_to(((scan[0] > -70) & (scan[0] < -3)), scan.shape)
+        scan = np.reshape(scan[mask], (3, -1))
+        scan = np.dot(np.dot(poses[i], G_posesource_laser), np.vstack([scan, np.ones((1, scan.shape[1]))])) # dot(4x4, 4xN)
+        pointcloud = np.hstack([pointcloud, scan])
+        count += 1
+
+    print("Number of poses = ", count)
 
     pointcloud = pointcloud[:, 1:]
     if pointcloud.shape[1] == 0:
@@ -133,10 +229,11 @@ if __name__ == "__main__":
 
     lidar = re.search('(lms_front|lms_rear|ldmrs|velodyne_left|velodyne_right)', args.laser_dir).group(0)
     timestamps_path = os.path.join(args.laser_dir, os.pardir, lidar + '.timestamps')
+    print(timestamps_path)
     with open(timestamps_path) as timestamps_file:
         start_time = int(next(timestamps_file).split(' ')[0])
 
-    end_time = start_time + 2e7
+    end_time = start_time + 2e8
 
     pointcloud, reflectance = build_pointcloud(args.laser_dir, args.poses_file,
                                                args.extrinsics_dir, start_time, end_time)
@@ -148,12 +245,12 @@ if __name__ == "__main__":
         colours = 'gray'
 
     # Pointcloud Visualisation using Open3D
-    vis = open3d.Visualizer()
+    vis = open3d.visualization.Visualizer()
     vis.create_window(window_name=os.path.basename(__file__))
     render_option = vis.get_render_option()
     render_option.background_color = np.array([0.1529, 0.1569, 0.1333], np.float32)
-    render_option.point_color_option = open3d.PointColorOption.ZCoordinate
-    coordinate_frame = open3d.geometry.create_mesh_coordinate_frame()
+    render_option.point_color_option = open3d.visualization.PointColorOption.ZCoordinate
+    coordinate_frame = open3d.geometry.TriangleMesh.create_coordinate_frame()
     vis.add_geometry(coordinate_frame)
     pcd = open3d.geometry.PointCloud()
     pcd.points = open3d.utility.Vector3dVector(

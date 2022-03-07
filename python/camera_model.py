@@ -68,11 +68,11 @@ class CameraModel:
 
         """
         if xyz.shape[0] == 3:
-            xyz = np.stack((xyz, np.ones((1, xyz.shape[1]))))
+            xyz = np.vstack((xyz, np.ones((1, xyz.shape[1]))))
         xyzw = np.linalg.solve(self.G_camera_image, xyz)
 
         # Find which points lie in front of the camera
-        in_front = [i for i in range(0, xyzw.shape[1]) if xyzw[2, i] >= 0]
+        in_front = [i for i in range(0, xyzw.shape[1]) if xyzw[2, i] > 0]
         xyzw = xyzw[:, in_front]
 
         uv = np.vstack((self.focal_length[0] * xyzw[0, :] / xyzw[2, :] + self.principal_point[0],

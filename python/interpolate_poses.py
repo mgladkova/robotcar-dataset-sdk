@@ -134,13 +134,14 @@ def interpolate_poses(pose_timestamps, abs_poses, requested_timestamps, origin_t
         abs_positions[:, i] = np.ravel(pose[0:3, 3])
 
     upper_indices = [bisect.bisect(pose_timestamps, pt) for pt in requested_timestamps]
-    lower_indices = [u - 1 for u in upper_indices]
+    lower_indices = [max(0, u - 1) for u in upper_indices]
 
     if max(upper_indices) >= len(pose_timestamps):
         upper_indices = [min(i, len(pose_timestamps) - 1) for i in upper_indices]
 
-    fractions = (requested_timestamps - pose_timestamps[lower_indices]) // \
+    fractions = (requested_timestamps - pose_timestamps[lower_indices]) * 1.0 / \
                 (pose_timestamps[upper_indices] - pose_timestamps[lower_indices])
+    fractions[pose_timestamps[upper_indices] == pose_timestamps[lower_indices]] = 0.0
 
     quaternions_lower = abs_quaternions[:, lower_indices]
     quaternions_upper = abs_quaternions[:, upper_indices]
