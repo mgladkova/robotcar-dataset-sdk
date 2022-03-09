@@ -16,11 +16,12 @@ import os
 import re
 import time
 import numpy as np
+import cv2
 
 from transform import build_se3_transform
 from interpolate_poses import interpolate_vo_poses, interpolate_ins_poses
 from velodyne import load_velodyne_raw, load_velodyne_binary, velodyne_raw_to_pointcloud
-
+from image import load_image
 
 def build_pointcloud(lidar_dir, poses_file, extrinsics_dir, start_time, end_time, origin_time=-1):
     """Builds a pointcloud by combining multiple LIDAR scans with odometry information.
@@ -124,17 +125,19 @@ def build_pointcloud(lidar_dir, poses_file, extrinsics_dir, start_time, end_time
     return pointcloud, reflectance
 
 
-def build_pointcloud_distance_range(lidar_dir, poses_file, extrinsics_dir, start_time, distance):
+def build_pointcloud_distance_range_masked(lidar_dir, poses_file, extrinsics_dir, start_time, G_camera_posesource, model, \
+                                            distance=20, img_timestamps=None, mask_dir=None):
     lidar = re.search('(lms_front|lms_rear|ldmrs|velodyne_left|velodyne_right)', lidar_dir).group(0)
     timestamps_path = os.path.join(lidar_dir, os.pardir, lidar + '.timestamps')
 
+    #hopefully enough to cover 20 m range (might not work in case of long stays)
     origin_time = start_time
-    end_time = start_time + 1e7 #hopefully enough to cover 20 m range (might not work in case of long stays)
+    end_time = start_time + 5e7
     timestamps = []
     with open(timestamps_path) as timestamps_file:
         for line in timestamps_file:
             timestamp = int(line.split(' ')[0])
-            if start_time <= timestamp <= end_time:
+            if origin_time <= timestamp <= end_time:
                 timestamps.append(timestamp)
 
     if len(timestamps) == 0:
@@ -146,6 +149,7 @@ def build_pointcloud_distance_range(lidar_dir, poses_file, extrinsics_dir, start
 
     poses_type = re.search('(vo|ins|rtk)\.csv', poses_file).group(1)
 
+    img_poses = None
     if poses_type in ['ins', 'rtk']:
         with open(os.path.join(extrinsics_dir, 'ins.txt')) as extrinsics_file:
             extrinsics = next(extrinsics_file)
@@ -153,9 +157,13 @@ def build_pointcloud_distance_range(lidar_dir, poses_file, extrinsics_dir, start
                                                  G_posesource_laser)
 
         poses = interpolate_ins_poses(poses_file, timestamps, origin_time, use_rtk=(poses_type == 'rtk'))
+        if not img_timestamps is None and not mask_dir is None:
+            img_poses = interpolate_ins_poses(poses_file, img_timestamps, origin_time, use_rtk=(poses_type == 'rtk'))
     else:
         # sensor is VO, which is located at the main vehicle frame
         poses = interpolate_vo_poses(poses_file, timestamps, origin_time)
+        if not img_timestamps is None and not mask_dir is None:
+            img_poses = interpolate_vo_poses(poses_file, img_timestamps, origin_time)
 
     pointcloud = np.array([[0], [0], [0], [0]])
     if lidar == 'ldmrs':
@@ -168,10 +176,11 @@ def build_pointcloud_distance_range(lidar_dir, poses_file, extrinsics_dir, start
     for i in range(0, len(poses)):
         diff_pose = np.linalg.inv(poses[i]) * orig_pose
         diff_pose_norm = np.linalg.norm(diff_pose[:3, 3])
-        if diff_pose_norm > 20:
+        if diff_pose_norm > distance:
             break
 
         scan_path = os.path.join(lidar_dir, str(timestamps[i]) + '.bin')
+        reflectance_current = None
         if "velodyne" not in lidar:
             if not os.path.isfile(scan_path):
                 continue
@@ -184,7 +193,8 @@ def build_pointcloud_distance_range(lidar_dir, poses_file, extrinsics_dir, start
 
             if lidar != 'ldmrs':
                 # LMS scans are tuples of (x, y, reflectance)
-                reflectance = np.concatenate((reflectance, np.ravel(scan[2, :])))
+                reflectance_current = np.ravel(scan[2, :])
+                # reflectance = np.concatenate((reflectance, np.ravel(scan[2, :])))
                 scan[2, :] = np.zeros((1, scan.shape[1]))
         else:
             if os.path.isfile(scan_path):
@@ -196,14 +206,55 @@ def build_pointcloud_distance_range(lidar_dir, poses_file, extrinsics_dir, start
                 ranges, intensities, angles, approximate_timestamps = load_velodyne_raw(scan_path)
                 ptcld = velodyne_raw_to_pointcloud(ranges, intensities, angles)
 
-            reflectance = np.concatenate((reflectance, ptcld[3]))
+            reflectance_current = ptcld[3]
             scan = ptcld[:3]
 
-        # removes points on the ego-car (x-axis points backward)
-        mask = np.broadcast_to(((scan[0] > -70) & (scan[0] < -3)), scan.shape)
+        # removes points on the ego-car (x-axis points backward), visible car part ~ 3.5 m
+        mask = ((scan[0] > -70) & (scan[0] < -4))
+        reflectance_current = reflectance_current[mask]
+        mask = np.broadcast_to(mask, scan.shape)
         scan = np.reshape(scan[mask], (3, -1))
-        scan = np.dot(np.dot(poses[i], G_posesource_laser), np.vstack([scan, np.ones((1, scan.shape[1]))])) # dot(4x4, 4xN)
-        pointcloud = np.hstack([pointcloud, scan])
+
+        scan_laser = np.dot(np.dot(poses[i], G_posesource_laser), np.vstack([scan, np.ones((1, scan.shape[1]))])) # dot(4x4, 4xN)
+        remove_indices = np.array([], dtype=int)
+        if not img_poses is None and not mask_dir is None:
+            img_pose = None
+            img_timestamp = None
+            kernel = np.ones((15, 15), 'uint8')
+            for j in range(1, len(img_timestamps)):
+                if img_timestamps[j - 1] <= timestamps[i] <= img_timestamps[j]:
+                    left_diff = timestamps[i] - img_timestamps[j - 1]
+                    right_diff = img_timestamps[j] - timestamps[i]
+                    if left_diff < right_diff and left_diff < 1e5:
+                        img_pose = img_poses[j - 1]
+                        img_timestamp = img_timestamps[j - 1]
+                    elif right_diff < 1e5:
+                        img_pose = img_poses[j]
+                        img_timestamp = img_timestamps[j]
+                    break
+
+            if not img_pose is None:
+                scan_camera = np.dot(np.dot(poses[i], G_posesource_laser), np.vstack([scan, np.ones((1, scan.shape[1]))])) # dot(4x4, 4xN)
+                scan_camera = np.dot(G_camera_posesource, scan_camera)
+                scan_image = np.linalg.solve(model.G_camera_image, scan_camera)
+
+                image_path = os.path.join(mask_dir, str(img_timestamp) + '.png')
+                image = load_image(image_path, model)
+                image = cv2.dilate(image, kernel)
+
+                points = np.vstack((model.focal_length[0] * scan_image[0, :] / scan_image[2, :] + model.principal_point[0],
+                                model.focal_length[1] * scan_image[1, :] / scan_image[2, :] + model.principal_point[1]))
+                for j in range(points.shape[1]):
+                    if 0.5 <= points[0, j] <= image.shape[1] and \
+                       0.5 <= points[1, j] <= image.shape[0] and \
+                       image[int(points[1, j]), int(points[0, j])][0]:
+                        remove_indices = np.append(remove_indices, j)
+        if remove_indices.shape[0] > 0:
+            scan_laser = np.delete(scan_laser, remove_indices, axis=1)
+            reflectance_current = np.delete(reflectance_current, remove_indices)
+
+        pointcloud = np.hstack([pointcloud, scan_laser])
+        reflectance = np.concatenate((reflectance, reflectance_current))
         count += 1
 
     print("Number of poses = ", count)
