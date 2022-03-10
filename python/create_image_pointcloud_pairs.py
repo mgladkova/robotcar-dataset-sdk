@@ -38,7 +38,10 @@ def load_timestamps(timestamps_path):
     timestamps = []
     with open(timestamps_path) as timestamps_file:
         for line in timestamps_file:
-            timestamps.append(int(line.split(' ')[0]))
+            line = line.rstrip()
+            entries = line.split()
+            timestamp = int(entries[0])
+            timestamps.append(timestamp)
     return timestamps
 
 def filter_pointcloud(xyzw, rflct, model, image_shape):
@@ -64,24 +67,33 @@ def remove_ground_plane(pointcloud):
     # create Pointcloud for processing
     pcd = open3d.geometry.PointCloud()
     pcd.points = open3d.utility.Vector3dVector(
-        -np.ascontiguousarray(pointcloud.transpose().astype(np.float64)))
+        np.ascontiguousarray(pointcloud.transpose().astype(np.float64)))
     # fit a ground plane
     plane_model, inliers = pcd.segment_plane(distance_threshold=0.3,
                                             ransac_n=3,
                                             num_iterations=3000)
     plane_normal = np.array(plane_model[:3])
     plane_normal /= np.linalg.norm(plane_normal)
-    print("Plane normal ", plane_normal)
 
-    # remove points on the plane
-    downpointcloud = pcd.select_by_index(inliers, invert=True)
+    if plane_normal[1] > 0:
+        plane_normal *= -1.
+    print(plane_normal)
 
-    # remove points below the plane
-    downpoints = np.asarray(downpointcloud.points)
+    threshold = -0.5
+    yaxis = np.array([[0.], [-1.], [0.]], dtype=float)
+    if np.arccos(np.dot(plane_normal, yaxis)) < 0.3:
+        # remove points on the plane
+        downpointcloud = pcd.select_by_index(inliers, invert=True)
+        # remove points below the plane
+        downpoints = np.asarray(downpointcloud.points)
+    else:
+        plane_normal = yaxis
+        downpoints = copy.copy(pointcloud.transpose())
+        downpointcloud = pcd
+        threshold = 0.5 # stricter threshold since we don't have exact ground plane normal
+
     distance_ground = np.dot(downpoints, plane_normal)
-    # camera is located ~1.36 meters above the ground
-    # so if plane passes through the camera origin then points below -1.36 should be below the ground
-    above_ground_idx = [i for i in range(len(distance_ground)) if distance_ground[i] > -1.3]
+    above_ground_idx = [i for i in range(len(distance_ground)) if distance_ground[i] > threshold]
     return downpointcloud.select_by_index(above_ground_idx)
 
 def downsample_pointcloud(pointcloud, num_points):
@@ -110,24 +122,22 @@ def downsample_pointcloud(pointcloud, num_points):
     if vsize != vsize_new:
         vsize = vsize_new
 
-    print("Final grid size = ", vsize)
-
     return downpointcloud
 
-def transform_image_laser(downpoints, model, extrinsics_dir, poses_file):
+def transform_image_laser(downpoints, model, extrinsics_dir, laser_dir, poses_file):
     _, G_camera_posesource = load_transforms(model, extrinsics_dir, poses_file)
     downpoints_homog = np.vstack((downpoints.T, np.ones((1, downpoints.shape[0]))))
     downpoints_camera = np.linalg.solve(np.linalg.inv(model.G_camera_image), downpoints_homog)
     downpoints_posesource = np.dot(np.linalg.inv(G_camera_posesource), downpoints_camera)
 
-    lidar = re.search('(lms_front|lms_rear|ldmrs|velodyne_left|velodyne_right)', args.laser_dir).group(0)
-    with open(os.path.join(args.extrinsics_dir, lidar + '.txt')) as extrinsics_file:
+    lidar = re.search('(lms_front|lms_rear|ldmrs|velodyne_left|velodyne_right)', laser_dir).group(0)
+    with open(os.path.join(extrinsics_dir, lidar + '.txt')) as extrinsics_file:
         extrinsics = next(extrinsics_file)
     G_posesource_laser = build_se3_transform([float(x) for x in extrinsics.split(' ')])
 
-    poses_type = re.search('(vo|ins|rtk)\.csv', args.poses_file).group(1)
+    poses_type = re.search('(vo|ins|rtk)\.csv', poses_file).group(1)
     if poses_type in ['ins', 'rtk']:
-        with open(os.path.join(args.extrinsics_dir, 'ins.txt')) as extrinsics_file:
+        with open(os.path.join(extrinsics_dir, 'ins.txt')) as extrinsics_file:
             extrinsics = next(extrinsics_file)
             G_posesource_laser = np.linalg.solve(build_se3_transform([float(x) for x in extrinsics.split(' ')]),
                                                  G_posesource_laser)
@@ -155,10 +165,8 @@ if __name__ == "__main__":
     parser.add_argument('--poses_file', type=str, help='File containing either INS or VO poses')
     parser.add_argument('--models_dir', type=str, help='Directory containing camera models')
     parser.add_argument('--extrinsics_dir', type=str, help='Directory containing sensor extrinsics')
-    parser.add_argument('--image_idx', type=int, default=0, help='Index of image to associate velodyne pointcloud to')
     parser.add_argument('--num_points', type=int, default=4500, help='Number of points in each pointcloud')
-    parser.add_argument('--visualize_ptcld', action='store_true')
-    parser.add_argument('--visualize_image', action='store_true')
+    parser.add_argument('--output_dir', type=str, help='Output directory for submaps per image')
 
     args = parser.parse_args()
 
@@ -169,51 +177,40 @@ if __name__ == "__main__":
     if not os.path.isfile(timestamps_path):
         timestamps_path = os.path.join(args.image_dir, os.pardir, os.pardir, model.camera + '.timestamps')
 
+    outdir = args.output_dir
+    if not os.path.exists(outdir):
+        os.makedirs(outdir)
+
     timestamps = load_timestamps(timestamps_path)
-    image_idx = args.image_idx
-    timestamp = timestamps[image_idx] if ((image_idx >= 0) and (image_idx < len(timestamps))) else timestamps[0]
+    for i in range(len(timestamps)):
+        timestamp = timestamps[i]
+        print("Image timestamp ", timestamp)
+        distance = 20
+        timestamps_copy = copy.deepcopy(timestamps)
+        ptcld, rflct = build_pointcloud_distance_range_masked(args.laser_dir, args.poses_file, args.extrinsics_dir, timestamp, G_camera_posesource, model, \
+                                                            distance, timestamps_copy, args.mask_dir)
 
-    print("Image timestamp ", timestamp)
-    distance = 20
-    ptcld, rflct = build_pointcloud_distance_range_masked(args.laser_dir, args.poses_file, args.extrinsics_dir, timestamp, G_camera_posesource, model, \
-                                                          distance, timestamps, args.mask_dir)
+        # transform velodyne pointcloud to camera coordinate system
+        xyz = np.dot(G_camera_posesource, ptcld)
+        if xyz.shape[0] == 3:
+            xyz = np.stack((xyz, np.ones((1, xyz.shape[1]))))
+        xyzw = np.linalg.solve(model.G_camera_image, xyz)
 
-    # transform velodyne pointcloud to camera coordinate system
-    xyz = np.dot(G_camera_posesource, ptcld)
-    if xyz.shape[0] == 3:
-        xyz = np.stack((xyz, np.ones((1, xyz.shape[1]))))
-    xyzw = np.linalg.solve(model.G_camera_image, xyz)
+        image_path = os.path.join(args.image_dir, str(timestamp) + '.png')
+        image = load_image(image_path, model)
 
-    image_path = os.path.join(args.image_dir, str(timestamp) + '.png')
-    image = load_image(image_path, model)
+        pointcloud = filter_pointcloud(xyzw, rflct, model, image.shape)
 
-    pointcloud = filter_pointcloud(xyzw, rflct, model, image.shape)
+        noplane_cloud = remove_ground_plane(pointcloud)
 
-    noplane_cloud = remove_ground_plane(pointcloud)
+        downpointcloud = downsample_pointcloud(noplane_cloud, args.num_points)
+        downpoints = np.asarray(downpointcloud.points)
 
-    downpointcloud = downsample_pointcloud(noplane_cloud, args.num_points)
-    downpoints = np.asarray(downpointcloud.points)
+        print("Number of downsampled points = ", downpoints.shape)
 
-    print("Number of downsampled points = ", downpoints.shape)
+        # transform to velodyne coordinate frame for the output
+        downpoints_laser = transform_image_laser(downpoints, model, args.extrinsics_dir, args.laser_dir, args.poses_file)
+        downpoints_laser = normalize_data(downpoints_laser)
 
-    if args.visualize_image:
-        depth_downsmpl = downpoints[:, 2]
-        uv_downsmpl = np.vstack((model.focal_length[0] * downpoints[:, 0] / depth_downsmpl + model.principal_point[0],
-                        model.focal_length[1] * downpoints[:, 1] / depth_downsmpl + model.principal_point[1]))
-
-        plt.imshow(image)
-        plt.scatter(np.ravel(uv_downsmpl[0, :]), np.ravel(uv_downsmpl[1, :]), s=2, c=depth_downsmpl, edgecolors='none', cmap='jet')
-        plt.xlim(0, image.shape[1])
-        plt.ylim(image.shape[0], 0)
-        plt.xticks([])
-        plt.yticks([])
-        plt.show()
-
-    # transform to velodyne coordinate frame for the output
-    downpoints_laser = transform_image_laser(downpoints, model, args.extrinsics_dir, args.poses_file)
-    downpoints_laser = normalize_data(downpoints_laser)
-
-    if args.visualize_ptcld:
-        downpcd = open3d.geometry.PointCloud()
-        downpcd.points = open3d.utility.Vector3dVector(-np.ascontiguousarray(np.asarray(downpoints_laser.T).astype(np.float64)))
-        open3d.visualization.draw_geometries([downpcd])
+        outfile = os.path.join(outdir, str(timestamp) + ".bin")
+        downpoints_laser.tofile(outfile)

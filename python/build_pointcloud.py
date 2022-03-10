@@ -174,7 +174,7 @@ def build_pointcloud_distance_range_masked(lidar_dir, poses_file, extrinsics_dir
     orig_pose = poses[0]
     count = 0
     for i in range(0, len(poses)):
-        diff_pose = np.linalg.inv(poses[i]) * orig_pose
+        diff_pose = poses[i] * np.linalg.inv(orig_pose)
         diff_pose_norm = np.linalg.norm(diff_pose[:3, 3])
         if diff_pose_norm > distance:
             break
