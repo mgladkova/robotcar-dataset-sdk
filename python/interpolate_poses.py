@@ -88,8 +88,13 @@ def interpolate_ins_poses(ins_path, pose_timestamps, origin_timestamp, use_rtk=F
             utm = row[5:8] if not use_rtk else row[4:7]
             rpy = row[-3:] if not use_rtk else row[11:14]
             xyzrpy = [float(v) for v in utm] + [float(v) for v in rpy]
+            if use_rtk:
+                #xyzrpy[-3:] = np.add(xyzrpy[-3:], [np.pi*2 + 0.04393643, np.pi*2 + 0.01565046, np.pi*2 - 1.56777765])
+                xyzrpy[-1] += np.pi*1.5 # add 270 deg to compensate for difference with INS
             abs_pose = build_se3_transform(xyzrpy)
             abs_poses.append(abs_pose)
+
+            #print(timestamp)
 
             if timestamp >= upper_timestamp:
                 break

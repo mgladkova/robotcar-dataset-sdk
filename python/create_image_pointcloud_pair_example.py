@@ -8,12 +8,14 @@ import matplotlib.pyplot as plt
 import argparse
 import open3d
 
-from build_pointcloud import build_pointcloud_distance_range_masked
+from build_pointcloud import build_pointcloud_distance_range_masked, build_pointcloud
 from image import load_image
 from camera_model import CameraModel
 
 from create_image_pointcloud_pairs import load_transforms, load_timestamps, filter_pointcloud, \
                                             remove_ground_plane, downsample_pointcloud, normalize_data, transform_image_laser
+
+from time import time
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Project LIDAR data into camera image')
@@ -31,20 +33,31 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     model = CameraModel(args.models_dir, args.image_dir)
+    start = time()
     _, G_camera_posesource = load_transforms(model, args.extrinsics_dir, args.poses_file)
+    end = time()
+    print("Load transforms took {} seconds".format(end - start))
 
     timestamps_path = os.path.join(args.image_dir, os.pardir, model.camera + '.timestamps')
     if not os.path.isfile(timestamps_path):
         timestamps_path = os.path.join(args.image_dir, os.pardir, os.pardir, model.camera + '.timestamps')
 
+    start = time()
     timestamps = load_timestamps(timestamps_path)
+    end = time()
+    print("Load timestamps took {} seconds".format(end - start))
     image_idx = args.image_idx
     timestamp = timestamps[image_idx] if ((image_idx >= 0) and (image_idx < len(timestamps))) else timestamps[0]
 
     print("Image timestamp ", timestamp)
-    distance = 20
+    distance = 30
+    start = time()
     ptcld, rflct = build_pointcloud_distance_range_masked(args.laser_dir, args.poses_file, args.extrinsics_dir, timestamp, G_camera_posesource, model, \
-                                                          distance, timestamps, args.mask_dir)
+                                                          distance=distance, img_timestamps=timestamps, mask_dir=args.mask_dir, min_point_number=args.num_points)
+    end = time()
+    print("Build pointcloud took {} seconds".format(end - start))
+
+    # ptcld, rflct = build_pointcloud(args.laser_dir, args.poses_file, args.extrinsics_dir, timestamp, timestamp + 1e7)
 
     # transform velodyne pointcloud to camera coordinate system
     xyz = np.dot(G_camera_posesource, ptcld)
@@ -55,12 +68,22 @@ if __name__ == "__main__":
     image_path = os.path.join(args.image_dir, str(timestamp) + '.png')
     image = load_image(image_path, model)
 
+    start = time()
     pointcloud = filter_pointcloud(xyzw, rflct, model, image.shape)
+    end = time()
+    print("Filter pointcloud took {} seconds".format(end - start))
 
+    start = time()
     noplane_cloud = remove_ground_plane(pointcloud)
+    end = time()
+    print("Remove ground plane took {} seconds".format(end - start))
 
+    #downpointcloud = noplane_cloud
+    start = time()
     downpointcloud = downsample_pointcloud(noplane_cloud, args.num_points)
     downpoints = np.asarray(downpointcloud.points)
+    end = time()
+    print("Downsampling took {} seconds".format(end - start))
 
     print("Number of downsampled points = ", downpoints.shape)
 

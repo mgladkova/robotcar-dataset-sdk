@@ -9,8 +9,11 @@ import matplotlib.pyplot as plt
 import argparse
 import open3d
 import copy
+import csv
+import sys
 
 from build_pointcloud import build_pointcloud_distance_range_masked
+from interpolate_poses import interpolate_ins_poses
 from transform import build_se3_transform
 from image import load_image
 from camera_model import CameraModel
@@ -46,7 +49,7 @@ def load_timestamps(timestamps_path):
 
 def filter_pointcloud(xyzw, rflct, model, image_shape):
     # find which points lie in front of the camera
-    in_front = [i for i in range(0, xyzw.shape[1]) if xyzw[2, i] > 0.1]
+    in_front = [i for i in range(0, xyzw.shape[1]) if xyzw[2, i] > 0]
     xyzw = xyzw[:, in_front]
     rflct = rflct[in_front]
 
@@ -56,7 +59,7 @@ def filter_pointcloud(xyzw, rflct, model, image_shape):
 
     # mask points in the frustum (front & image range) of the camera
     u, v, depth = np.ravel(uv[0, :]), np.ravel(uv[1, :]), np.ravel(xyzw[2, :])
-    mask_depth = ((depth > 0) & (depth < 70))
+    mask_depth = (depth > 0)
     mask_image = ((u >= 0.5) & (u < image_shape[1]) & (v >= 0.5) & \
                 (v < image_shape[0]))
     mask = (mask_depth & mask_image)
@@ -68,18 +71,21 @@ def remove_ground_plane(pointcloud):
     pcd = open3d.geometry.PointCloud()
     pcd.points = open3d.utility.Vector3dVector(
         np.ascontiguousarray(pointcloud.transpose().astype(np.float64)))
-    # fit a ground plane
-    plane_model, inliers = pcd.segment_plane(distance_threshold=0.3,
+
+    if pointcloud.shape[1] < 100:
+        return pcd
+
+    #fit a ground plane
+    plane_model, inliers = pcd.segment_plane(distance_threshold=0.1,
                                             ransac_n=3,
-                                            num_iterations=3000)
+                                            num_iterations=1000)
     plane_normal = np.array(plane_model[:3])
     plane_normal /= np.linalg.norm(plane_normal)
 
     if plane_normal[1] > 0:
         plane_normal *= -1.
-    print(plane_normal)
 
-    threshold = -0.5
+    threshold = -1.0
     yaxis = np.array([[0.], [-1.], [0.]], dtype=float)
     if np.arccos(np.dot(plane_normal, yaxis)) < 0.3:
         # remove points on the plane
@@ -90,13 +96,18 @@ def remove_ground_plane(pointcloud):
         plane_normal = yaxis
         downpoints = copy.copy(pointcloud.transpose())
         downpointcloud = pcd
-        threshold = 0.5 # stricter threshold since we don't have exact ground plane normal
+        #threshold = 0.5 # stricter threshold since we don't have exact ground plane normal
+
+    #print(plane_normal)
 
     distance_ground = np.dot(downpoints, plane_normal)
     above_ground_idx = [i for i in range(len(distance_ground)) if distance_ground[i] > threshold]
     return downpointcloud.select_by_index(above_ground_idx)
 
 def downsample_pointcloud(pointcloud, num_points):
+    if np.asarray(pointcloud.points).shape[0] < num_points:
+        return pointcloud
+
     vsize = 0.5
     downpointcloud = pointcloud.voxel_down_sample(voxel_size=vsize)
 
@@ -157,18 +168,35 @@ def normalize_data(pointcloud):
     downpoints_laser = 2.*(downpoints_laser - downpoints_laser_min) / downpoints_laser_ptp - 1
     return downpoints_laser
 
+def load_image_rtk(filepath):
+    img_rtk_transl = {}
+    with open(filepath, newline='') as csvfile:
+        next(csvfile)
+        csvreader = csv.reader(csvfile, delimiter=',', quotechar='|')
+        for row in csvreader:
+            timestamp = int(row[0])
+            transl = np.array([float(row[1]), float(row[2])])
+            img_rtk_transl[timestamp] = transl
+
+    return img_rtk_transl
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Project LIDAR data into camera image')
     parser.add_argument('--image_dir', type=str, help='Directory containing images')
     parser.add_argument('--laser_dir', type=str, help='Directory containing LIDAR scans')
     parser.add_argument('--mask_dir', type=str, help='Directory containing masks to remove movable objects from the scans')
     parser.add_argument('--poses_file', type=str, help='File containing either INS or VO poses')
-    parser.add_argument('--models_dir', type=str, help='Directory containing camera models')
+    parser.add_argument('--image_rtk', type=str, help='File containing RTK absolute poses for image timestamps')
+    parser.add_argument('--models_dir', type=str, default=None, help='Directory containing camera models')
     parser.add_argument('--extrinsics_dir', type=str, help='Directory containing sensor extrinsics')
-    parser.add_argument('--num_points', type=int, default=4500, help='Number of points in each pointcloud')
     parser.add_argument('--output_dir', type=str, help='Output directory for submaps per image')
+    parser.add_argument('--num_points', type=int, default=4500, help='Number of points in each pointcloud')
+    parser.add_argument('--start_frame', type=int, default=0, help='Image index to start the collection from')
+    parser.add_argument('--log', type=str, default='log.txt', help='Log file to write stdout to')
 
     args = parser.parse_args()
+
+    sys.stdout = open(args.log, 'w')
 
     model = CameraModel(args.models_dir, args.image_dir)
     _, G_camera_posesource = load_transforms(model, args.extrinsics_dir, args.poses_file)
@@ -178,39 +206,66 @@ if __name__ == "__main__":
         timestamps_path = os.path.join(args.image_dir, os.pardir, os.pardir, model.camera + '.timestamps')
 
     outdir = args.output_dir
-    if not os.path.exists(outdir):
-        os.makedirs(outdir)
+    outsubdir = os.path.join(outdir, "pointcloud_30m_15overlap")
+    if not os.path.exists(outsubdir):
+        os.makedirs(outsubdir)
+    csvfilename = os.path.join(outdir, "pointcloud_30m_15overlap.csv")
 
+    submap_dist_thresh = 15
+    submap_range = 30
     timestamps = load_timestamps(timestamps_path)
-    for i in range(len(timestamps)):
-        timestamp = timestamps[i]
-        print("Image timestamp ", timestamp)
-        distance = 20
-        timestamps_copy = copy.deepcopy(timestamps)
-        ptcld, rflct = build_pointcloud_distance_range_masked(args.laser_dir, args.poses_file, args.extrinsics_dir, timestamp, G_camera_posesource, model, \
-                                                            distance, timestamps_copy, args.mask_dir)
+    start_idx = args.start_frame
+    #img_poses = interpolate_ins_poses(args.poses_file, timestamps, timestamps[0], use_rtk=("rtk" in args.poses_file))
+    img_rtk_poses = load_image_rtk(args.image_rtk)
+    prev_image_idx = -1
+    print("Loaded {} image poses".format(len(img_rtk_poses)))
+    with open(csvfilename, 'w', newline='') as csvfile:
+        csvwriter = csv.writer(csvfile, delimiter=',',
+                            quotechar='|', quoting=csv.QUOTE_MINIMAL)
+        csvwriter.writerow(['timestamp', 'northing', 'easting'])
 
-        # transform velodyne pointcloud to camera coordinate system
-        xyz = np.dot(G_camera_posesource, ptcld)
-        if xyz.shape[0] == 3:
-            xyz = np.stack((xyz, np.ones((1, xyz.shape[1]))))
-        xyzw = np.linalg.solve(model.G_camera_image, xyz)
+        for i in range(start_idx, len(timestamps)):
+            timestamp = timestamps[i]
+            if prev_image_idx >= 0:
+                rel_transform = img_rtk_poses[timestamps[prev_image_idx]]- img_rtk_poses[timestamp]
+                if np.linalg.norm(rel_transform) < submap_dist_thresh:
+                    continue
 
-        image_path = os.path.join(args.image_dir, str(timestamp) + '.png')
-        image = load_image(image_path, model)
+            print("Image timestamp ", timestamp)
+            ptcld, rflct = build_pointcloud_distance_range_masked(args.laser_dir, args.poses_file, args.extrinsics_dir, timestamp, G_camera_posesource, model, \
+                                                                distance=submap_range, min_point_number=args.num_points)
 
-        pointcloud = filter_pointcloud(xyzw, rflct, model, image.shape)
+            # transform velodyne pointcloud to camera coordinate system
+            xyz = np.dot(G_camera_posesource, ptcld)
+            if xyz.shape[0] == 3:
+                xyz = np.stack((xyz, np.ones((1, xyz.shape[1]))))
+            xyzw = np.linalg.solve(model.G_camera_image, xyz)
 
-        noplane_cloud = remove_ground_plane(pointcloud)
+            image_path = os.path.join(args.image_dir, str(timestamp) + '.png')
+            image = load_image(image_path, model)
 
-        downpointcloud = downsample_pointcloud(noplane_cloud, args.num_points)
-        downpoints = np.asarray(downpointcloud.points)
+            pointcloud = filter_pointcloud(xyzw, rflct, model, image.shape)
 
-        print("Number of downsampled points = ", downpoints.shape)
+            noplane_cloud = remove_ground_plane(pointcloud)
 
-        # transform to velodyne coordinate frame for the output
-        downpoints_laser = transform_image_laser(downpoints, model, args.extrinsics_dir, args.laser_dir, args.poses_file)
-        downpoints_laser = normalize_data(downpoints_laser)
+            downpointcloud = downsample_pointcloud(noplane_cloud, args.num_points)
+            downpoints = np.asarray(downpointcloud.points)
 
-        outfile = os.path.join(outdir, str(timestamp) + ".bin")
-        downpoints_laser.tofile(outfile)
+            print("Number of downsampled points = ", downpoints.shape)
+
+            if downpoints.shape[0] < 1000:
+                prev_image_idx = i
+                continue
+
+            # transform to velodyne coordinate frame for the output
+            downpoints_laser = transform_image_laser(downpoints, model, args.extrinsics_dir, args.laser_dir, args.poses_file)
+            downpoints_laser = normalize_data(downpoints_laser)
+
+            outfile = os.path.join(outsubdir, str(timestamp) + ".bin")
+            downpoints_laser.tofile(outfile)
+            prev_image_idx = i
+
+            csvwriter.writerow([timestamp, *img_rtk_poses[timestamp]])
+            sys.stdout.flush()
+
+    sys.stdout.close()
