@@ -168,17 +168,41 @@ def normalize_data(pointcloud):
     downpoints_laser = 2.*(downpoints_laser - downpoints_laser_min) / downpoints_laser_ptp - 1
     return downpoints_laser
 
-def load_image_rtk(filepath):
+def load_image_rtk(filepath, full=False):
     img_rtk_transl = {}
     with open(filepath, newline='') as csvfile:
         next(csvfile)
         csvreader = csv.reader(csvfile, delimiter=',', quotechar='|')
         for row in csvreader:
             timestamp = int(row[0])
-            transl = np.array([float(row[1]), float(row[2])])
+            if full:
+                assert(len(row) == 7)
+                transl = build_se3_transform([float(x) for x in row[1:]])
+            else:
+                transl = np.array([float(row[1]), float(row[2])])
             img_rtk_transl[timestamp] = transl
 
     return img_rtk_transl
+
+def filter_positive_pairs_by_projection(ptcld, rtk_pose, dataset_dir, submaps_all, orig_pos_indices, model, G_camera_posesource, image_shape):
+    G_ref_image =  np.dot(np.linalg.inv(model.G_camera_image), np.dot(G_camera_posesource, rtk_pose))
+    ptcld_world = np.linalg.solve(G_ref_image, ptcld)
+    reflect = np.ones((ptcld_world.shape[0]))
+    filtered_indices = []
+    for idx in orig_pos_indices:
+        seq_dir, img_timestamp = submaps_all.iloc[idx]['timestamp'].split('/')
+        img_rtk_poses_file = os.path.join(dataset_dir, "image_rtk_new", seq_dir, "image_rtk_full.csv")
+        img_rtk_poses = load_image_rtk(img_rtk_poses_file, full=True)
+        G_image = np.linalg.solve(model.G_camera_image, np.dot(G_camera_posesource, img_rtk_poses[img_timestamp]))
+        ptcld_pos = np.dot(G_image, ptcld_world)
+
+        dummy = copy.copy(reflect)
+        filtered_ptcld = filter_pointcloud(ptcld_pos, dummy, model, image_shape)
+        print(filtered_ptcld.shape)
+
+        if filtered_ptcld.shape[0] > 0.3*ptcld_world.shape[0]:
+            filtered_indices.append(idx)
+    return filtered_indices
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Project LIDAR data into camera image')
