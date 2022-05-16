@@ -22,7 +22,7 @@ BAYER_STEREO = 'gbrg'
 BAYER_MONO = 'rggb'
 
 
-def load_image(image_path, model=None, debayer=False):
+def load_image(image_path, model=None, debayer=True):
     """Loads and rectifies an image from file.
 
     Args:
@@ -43,17 +43,20 @@ def load_image(image_path, model=None, debayer=False):
         pattern = BAYER_MONO
 
     img = Image.open(image_path)
+
     img = np.array(img).astype(np.uint8)
     img_orig_shape = (img.shape[1], img.shape[0])
 
     if img_orig_shape[0] < 1280:
         img = cv2.resize(img, (1280, 960), interpolation=cv2.INTER_CUBIC)
+        debayer = False
 
     if debayer:
         img = demosaic(img, pattern)
     if model:
         img = model.undistort(img)
 
-    img = cv2.resize(img, img_orig_shape, interpolation=cv2.INTER_CUBIC)
-    return img
+    if img_orig_shape[0] < 1280:
+        img = cv2.resize(img, img_orig_shape, interpolation=cv2.INTER_CUBIC)
+    return np.array(img).astype(np.uint8)
 

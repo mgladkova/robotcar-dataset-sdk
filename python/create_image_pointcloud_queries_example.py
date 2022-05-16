@@ -58,11 +58,16 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     image_dir = args.image_dir
-    assert(len(image_dir) > 0)
-    if image_dir[-1] == '/':
-        image_dir = image_dir[:-1] # remove trailing slash if present
+    submaps_dir = args.submaps_dir
+    poses_file = args.poses_file
+    laser_dir = args.laser_dir
 
-    dataset_dir, current_seq = image_dir[:image_dir.rfind('/')], image_dir[image_dir.rfind('/') + 1:]
+    dataset_dir = laser_dir[:laser_dir.find('/20')]
+    current_seq = laser_dir[laser_dir.find('/20') + 1:]
+    current_seq = current_seq[:current_seq.find('/')]
+    print("Dataset directory ", dataset_dir)
+    print("Current sequence ", current_seq)
+
     assert('full' in args.image_rtk)
 
     df_submaps, kdtree = build_kd_tree(args.submaps_dir, current_seq)
@@ -73,7 +78,7 @@ if __name__ == "__main__":
 
     model = CameraModel(args.models_dir, image_dir)
     start = time()
-    _, G_camera_posesource = load_transforms(model, args.extrinsics_dir, args.poses_file)
+    _, G_camera_posesource = load_transforms(model, args.extrinsics_dir, poses_file)
     end = time()
     print("Load transforms took {} seconds".format(end - start))
 
@@ -90,18 +95,18 @@ if __name__ == "__main__":
 
     print("Image timestamp ", timestamp)
 
-    print(img_rtk_poses[timestamp])
-    ind_nn = kdtree.query_radius([img_rtk_poses[timestamp][:2, 3]], r=10)
+    print(img_rtk_poses[timestamp][:2, 3].flatten())
+    ind_nn = kdtree.query_radius(img_rtk_poses[timestamp][:2, 3].flatten(), r=10)
     print("Number of positives within radius of 10 m = ", len(ind_nn[0]))
 
     distance = 30
     start = time()
-    ptcld, rflct = build_pointcloud_distance_range_masked(args.laser_dir, args.poses_file, args.extrinsics_dir, timestamp, G_camera_posesource, model, \
+    ptcld, rflct = build_pointcloud_distance_range_masked(laser_dir, poses_file, args.extrinsics_dir, timestamp, G_camera_posesource, model, \
                                                           distance=distance, img_timestamps=timestamps, mask_dir=args.mask_dir, min_point_number=args.num_points)
     end = time()
     print("Build pointcloud took {} seconds".format(end - start))
 
-    # ptcld, rflct = build_pointcloud(args.laser_dir, args.poses_file, args.extrinsics_dir, timestamp, timestamp + 1e7)
+    # ptcld, rflct = build_pointcloud(laser_dir, poses_file, args.extrinsics_dir, timestamp, timestamp + 1e7)
 
     # transform velodyne pointcloud to camera coordinate system
     xyz = np.dot(G_camera_posesource, ptcld)
@@ -131,9 +136,6 @@ if __name__ == "__main__":
 
     print("Number of downsampled points = ", downpoints.shape)
 
-    filtered_ind_nn = filter_positive_pairs_by_projection(downpoints, img_rtk_poses[timestamp], dataset_dir, df_submaps, ind_nn[0], model, G_camera_posesource, image.shape)
-    print("Filtered number of positive pairs: ", len(filtered_ind_nn))
-
     if args.visualize_image:
         depth_downsmpl = downpoints[:, 2]
         uv_downsmpl = np.vstack((model.focal_length[0] * downpoints[:, 0] / depth_downsmpl + model.principal_point[0],
@@ -147,8 +149,14 @@ if __name__ == "__main__":
         plt.yticks([])
         plt.show()
 
+    print(img_rtk_poses[timestamp])
+    filtered_ind_nn = filter_positive_pairs_by_projection(downpoints, img_rtk_poses[timestamp], dataset_dir, df_submaps, \
+                                                          ind_nn[0], model, G_camera_posesource, image.shape)
+    print("Filtered number of positive pairs: ", len(filtered_ind_nn))
+
+
     # transform to velodyne coordinate frame for the output
-    downpoints_laser = transform_image_laser(downpoints, model, args.extrinsics_dir, args.laser_dir, args.poses_file)
+    downpoints_laser = transform_image_laser(downpoints, model, args.extrinsics_dir, laser_dir, poses_file)
     downpoints_laser = normalize_data(downpoints_laser)
 
     if args.visualize_ptcld:

@@ -108,3 +108,4 @@ if __name__ == "__main__":
         downpcd = open3d.geometry.PointCloud()
         downpcd.points = open3d.utility.Vector3dVector(np.ascontiguousarray(np.asarray(downpoints_laser.T).astype(np.float64)))
         open3d.visualization.draw_geometries([downpcd])
+        # open3d.io.write_point_cloud("test.ply", downpcd)

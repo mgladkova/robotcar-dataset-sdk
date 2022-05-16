@@ -84,7 +84,7 @@ def build_pointcloud(lidar_dir, poses_file, extrinsics_dir, start_time, end_time
     else:
         reflectance = np.empty((0))
 
-    print("Number of poses = ", len(poses))
+    #print("Number of poses = ", len(poses))
     for i in range(0, len(poses)):
         scan_path = os.path.join(lidar_dir, str(timestamps[i]) + '.bin')
         if "velodyne" not in lidar:
@@ -132,9 +132,9 @@ def build_pointcloud_distance_range_masked(lidar_dir, poses_file, extrinsics_dir
     lidar = re.search('(lms_front|lms_rear|ldmrs|velodyne_left|velodyne_right)', lidar_dir).group(0)
     timestamps_path = os.path.join(lidar_dir, os.pardir, lidar + '.timestamps')
 
-    #hopefully enough to cover 20 m range (might not work in case of long stays)
-    start_time = origin_time - 1e5
-    end_time = origin_time + 5e7
+    #hopefully enough to cover 50 m range (might not work in case of long stays)
+    start_time = origin_time
+    end_time = origin_time + 5e8
     timestamps = []
     with open(timestamps_path) as timestamps_file:
         for line in timestamps_file:
@@ -176,9 +176,9 @@ def build_pointcloud_distance_range_masked(lidar_dir, poses_file, extrinsics_dir
     orig_pose = poses[0]
     count = 0
     for i in range(0, len(poses)):
-        diff_pose = poses[i] * np.linalg.inv(orig_pose)
+        diff_pose = np.linalg.inv(orig_pose) @ poses[i] # convention: camera-world
         diff_pose_norm = np.linalg.norm(diff_pose[:3, 3])
-        if diff_pose_norm > distance and pointcloud.shape[1] > min_point_number:
+        if diff_pose_norm > distance:
             break
 
         scan_path = os.path.join(lidar_dir, str(timestamps[i]) + '.bin')
@@ -217,11 +217,11 @@ def build_pointcloud_distance_range_masked(lidar_dir, poses_file, extrinsics_dir
             reflectance_current = ptcld[3]
             scan = ptcld[:3]
 
-        # removes points on the ego-car (x-axis points backward), visible car part ~ 3.5 m
-        #mask = (scan[0] < -4)
-        # reflectance_current = reflectance_current[mask]
-        # mask = np.broadcast_to(mask, scan.shape)
-        # scan = np.reshape(scan[mask], (3, -1))
+            #removes points on the ego-car (x-axis points backward), visible car part ~ 3.5 m
+            mask = (scan[0] < -4)
+            reflectance_current = reflectance_current[mask]
+            mask = np.broadcast_to(mask, scan.shape)
+            scan = np.reshape(scan[mask], (3, -1))
 
         scan_laser = np.dot(np.dot(poses[i], G_posesource_laser), np.vstack([scan, np.ones((1, scan.shape[1]))])) # dot(4x4, 4xN)
         remove_indices = np.array([], dtype=int)
@@ -268,7 +268,7 @@ def build_pointcloud_distance_range_masked(lidar_dir, poses_file, extrinsics_dir
         reflectance = np.concatenate((reflectance, reflectance_current))
         count += 1
 
-    print("Number of poses = ", count)
+    #print("Number of poses = ", count)
 
     pointcloud = pointcloud[:, 1:]
     if pointcloud.shape[1] == 0:

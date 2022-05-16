@@ -47,24 +47,36 @@ def load_timestamps(timestamps_path):
             timestamps.append(timestamp)
     return timestamps
 
-def filter_pointcloud(xyzw, rflct, model, image_shape):
+def load_timestamps_submaps_csv(submaps_csv_path):
+    timestamps = []
+    with open(submaps_csv_path, newline='') as csvfile:
+        next(csvfile)
+        csvreader = csv.reader(csvfile, delimiter=',', quotechar='|')
+        for row in csvreader:
+            timestamp = int(row[0])
+            timestamps.append(timestamp)
+    return np.array(timestamps)
+
+def filter_pointcloud(ptcld, rflct, model, image_shape):
     # find which points lie in front of the camera
+    xyzw = copy.copy(ptcld)
     in_front = [i for i in range(0, xyzw.shape[1]) if xyzw[2, i] > 0]
     xyzw = xyzw[:, in_front]
     rflct = rflct[in_front]
+
+    #print("In front of the camera ", np.count_nonzero(in_front))
 
     # find which points lie in the image range
     uv = np.vstack((model.focal_length[0] * xyzw[0, :] / xyzw[2, :] + model.principal_point[0],
                     model.focal_length[1] * xyzw[1, :] / xyzw[2, :] + model.principal_point[1]))
 
     # mask points in the frustum (front & image range) of the camera
-    u, v, depth = np.ravel(uv[0, :]), np.ravel(uv[1, :]), np.ravel(xyzw[2, :])
-    mask_depth = (depth > 0)
+    u, v = np.ravel(uv[0, :]), np.ravel(uv[1, :])
     mask_image = ((u >= 0.5) & (u < image_shape[1]) & (v >= 0.5) & \
                 (v < image_shape[0]))
-    mask = (mask_depth & mask_image)
 
-    return xyzw[:3, mask]
+    #print("Within the image ", np.count_nonzero(mask_image))
+    return xyzw[:3, mask_image]
 
 def remove_ground_plane(pointcloud):
     # create Pointcloud for processing
@@ -177,7 +189,9 @@ def load_image_rtk(filepath, full=False):
             timestamp = int(row[0])
             if full:
                 assert(len(row) == 7)
-                transl = build_se3_transform([float(x) for x in row[1:]])
+                xyzrpy = [float(x) for x in row[1:]]
+                xyzrpy[-1] += np.pi * 1.5 # fix bug for yaw angle in RTK poses
+                transl = build_se3_transform(xyzrpy)
             else:
                 transl = np.array([float(row[1]), float(row[2])])
             img_rtk_transl[timestamp] = transl
@@ -185,22 +199,24 @@ def load_image_rtk(filepath, full=False):
     return img_rtk_transl
 
 def filter_positive_pairs_by_projection(ptcld, rtk_pose, dataset_dir, submaps_all, orig_pos_indices, model, G_camera_posesource, image_shape):
-    G_ref_image =  np.dot(np.linalg.inv(model.G_camera_image), np.dot(G_camera_posesource, rtk_pose))
-    ptcld_world = np.linalg.solve(G_ref_image, ptcld)
-    reflect = np.ones((ptcld_world.shape[0]))
+    ptcld_hom = np.vstack((ptcld.T, np.ones((1, ptcld.shape[0]))))
+    ptcld_posesource = np.linalg.solve(G_camera_posesource, np.dot(model.G_camera_image, ptcld_hom))
+    ptcld_world = np.dot(rtk_pose, ptcld_posesource)
+    reflect = np.ones((ptcld_world.shape[1], 1))
     filtered_indices = []
     for idx in orig_pos_indices:
         seq_dir, img_timestamp = submaps_all.iloc[idx]['timestamp'].split('/')
+        img_timestamp = int(img_timestamp[:img_timestamp.rfind('.')])
         img_rtk_poses_file = os.path.join(dataset_dir, "image_rtk_new", seq_dir, "image_rtk_full.csv")
+
         img_rtk_poses = load_image_rtk(img_rtk_poses_file, full=True)
-        G_image = np.linalg.solve(model.G_camera_image, np.dot(G_camera_posesource, img_rtk_poses[img_timestamp]))
-        ptcld_pos = np.dot(G_image, ptcld_world)
+        ptcld_pos = np.linalg.solve(model.G_camera_image, np.dot(G_camera_posesource, np.linalg.solve(img_rtk_poses[img_timestamp], ptcld_world)))
 
         dummy = copy.copy(reflect)
         filtered_ptcld = filter_pointcloud(ptcld_pos, dummy, model, image_shape)
-        print(filtered_ptcld.shape)
+        filtered_ptcld = filtered_ptcld.T
 
-        if filtered_ptcld.shape[0] > 0.3*ptcld_world.shape[0]:
+        if filtered_ptcld.shape[0] > 0.3*ptcld_world.shape[1]:
             filtered_indices.append(idx)
     return filtered_indices
 
@@ -230,16 +246,15 @@ if __name__ == "__main__":
         timestamps_path = os.path.join(args.image_dir, os.pardir, os.pardir, model.camera + '.timestamps')
 
     outdir = args.output_dir
-    outsubdir = os.path.join(outdir, "pointcloud_30m_15overlap")
+    outsubdir = os.path.join(outdir, "pointcloud_50m_25overlap")
     if not os.path.exists(outsubdir):
         os.makedirs(outsubdir)
-    csvfilename = os.path.join(outdir, "pointcloud_30m_15overlap.csv")
+    csvfilename = os.path.join(outdir, "pointcloud_50m_25overlap.csv")
 
-    submap_dist_thresh = 15
-    submap_range = 30
+    submap_dist_thresh = 25
+    submap_range = 50
     timestamps = load_timestamps(timestamps_path)
     start_idx = args.start_frame
-    #img_poses = interpolate_ins_poses(args.poses_file, timestamps, timestamps[0], use_rtk=("rtk" in args.poses_file))
     img_rtk_poses = load_image_rtk(args.image_rtk)
     prev_image_idx = -1
     print("Loaded {} image poses".format(len(img_rtk_poses)))
@@ -283,7 +298,7 @@ if __name__ == "__main__":
 
             # transform to velodyne coordinate frame for the output
             downpoints_laser = transform_image_laser(downpoints, model, args.extrinsics_dir, args.laser_dir, args.poses_file)
-            downpoints_laser = normalize_data(downpoints_laser)
+            #downpoints_laser = normalize_data(downpoints_laser)
 
             outfile = os.path.join(outsubdir, str(timestamp) + ".bin")
             downpoints_laser.tofile(outfile)
